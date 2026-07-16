@@ -161,6 +161,77 @@ docker logs litellm-litellm-1 2>&1 | grep "CodexAdditionalToolsFlatten"
 # 预期输出: "removed additional_tools item(s), flattened N tool(s) into top-level tools"
 ```
 
+## Callback 工作原理
+
+`codex_additional_tools_flatten` 本质是一个 **pre-call hook**（请求预处理钩子），在 LiteLLM 将请求转发给后端之前拦截并改写 request body。
+
+### 执行时机
+
+```
+Codex CLI 发请求 → LiteLLM 收到 → 【async_pre_call_hook 介入】→ 转发给 Bedrock Mantle
+```
+
+LiteLLM 的 CustomLogger 体系提供多个生命周期钩子，这里用的是 `async_pre_call_hook` — 在请求真正发往后端之前修改 data dict。
+
+### 改写逻辑（3 步）
+
+**Step 1 — 扫描 `input[]`，识别 `additional_tools` item**
+
+Codex 发来的请求体：
+```json
+{
+  "input": [
+    {"type": "additional_tools", "role": "developer", "tools": [tool1, tool2, ...]},
+    {"type": "message", "role": "user", "content": "..."}
+  ],
+  "tools": []
+}
+```
+
+`additional_tools` 是 Codex 私有的 input item 类型，Bedrock Mantle 不认识。
+
+**Step 2 — 将 tools 提升到顶层 `data["tools"]`**
+
+```python
+data["tools"] = existing_tools + extra_tools
+```
+
+**Step 3 — 从 `input[]` 中移除 `additional_tools` item**
+
+```python
+data["input"] = [item for item in input if item["type"] != "additional_tools"]
+```
+
+### 改写前后对比
+
+```
+改写前（Bedrock 拒绝 ❌）:          改写后（Bedrock 接受 ✅）:
+{                                    {
+  "input": [                           "input": [
+    {"type": "additional_tools",         {"type": "message", ...}
+     "tools": [...]},                  ],
+    {"type": "message", ...}           "tools": [tool1, tool2, ...]
+  ],                                 }
+  "tools": []
+}
+```
+
+### 安全设计
+
+| 机制 | 说明 |
+|------|------|
+| Scope guard | 只拦截 `aresponses`（Responses API 调用），不碰 chat completions |
+| 幂等性 | input 中没有 `additional_tools` item 时原样返回，零副作用 |
+| 容错 | 整个逻辑包在 try/except，改写失败放行原始请求，不会丢请求 |
+| 空 tools 处理 | 后续轮次 Codex 会发空的 `additional_tools` item（tools 已建立），也必须移除否则仍 400 |
+
+### 为什么需要这个 Hook？
+
+- **Codex 直连 Bedrock 没问题** — 内置 `amazon-bedrock` provider 在客户端做了格式转换
+- **通过 LiteLLM 时有问题** — LiteLLM 的 `openai/` 和 `bedrock_mantle/` provider 都是 passthrough，不做 input item 类型校验
+- **LiteLLM `drop_params` 不生效** — 该参数只作用于 `/v1/chat/completions`，不处理 Responses API 的 input items
+- **本 callback 补齐了这个缺口** — 作为 request rewriter 将 Codex 私有协议翻译为标准 OpenAI Responses API 格式
+
 ## 架构图
 
 ```
