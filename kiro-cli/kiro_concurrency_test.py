@@ -7,7 +7,7 @@ import time
 import os
 
 KIRO_CLI = "/root/.local/bin/kiro-cli"
-os.environ["KIRO_API_KEY"] = "ksk_MiFCh1b87NWjp9j6hhG13YseDTFWImHY"
+os.environ["KIRO_API_KEY"] = "ksk_MiFC*"
 
 
 async def kiro_chat(session_num: int):
