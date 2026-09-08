@@ -111,7 +111,32 @@ VPCE Policy 是独立于 IAM Policy 的**第二层访问控制**，两者都必�
 }
 ```
 
-### 限定 Principal（生产环境）
+### 限定账号（推荐）
+
+使用 `aws:PrincipalAccount` 条件键，允许该账号下所有 IAM 实体（包括 Bedrock API Key 自动创建的 IAM User）通过 VPCE 访问，无需逐个列出 Principal。
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "*",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:PrincipalAccount": "<account-id>"
+        }
+      }
+    }
+  ]
+}
+```
+
+> **优势**：新增 Bedrock API Key 或 IAM Role 时无需更新 VPCE Policy，只要在同一账号下即可访问。
+
+### 限定具体 Principal（精细控制）
 
 ```json
 {
@@ -132,7 +157,7 @@ VPCE Policy 是独立于 IAM Policy 的**第二层访问控制**，两者都必�
 }
 ```
 
-> **关键**：Bearer Token（Bedrock API Key）的请求身份是系统自动创建的 IAM User `BedrockAPIKey-xxxx`，VPCE Policy 中的 Principal 需要包含这个 User。可通过 `aws iam list-users` 查看。
+> **注意**：Bearer Token（Bedrock API Key）的请求身份是系统自动创建的 IAM User `BedrockAPIKey-xxxx`，VPCE Policy 中的 Principal 需要包含这个 User。可通过 `aws iam list-users` 查看。
 
 ## 常见问题排查
 
