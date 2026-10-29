@@ -1,6 +1,7 @@
 # g6e.24xlarge（4× L40S）NCCL AllReduce 实测与调优
 
 > 测试时间：2026-10 | 工具：nccl-tests `all_reduce_perf` | 结论先行，原理与数据在后
+> 相关：[GPU 集群性能测试清单（七层框架）](gpu-cluster-benchmark-checklist.md) — 本文属于其中第 ③ 层“单机卡间”
 
 ## TL;DR
 
