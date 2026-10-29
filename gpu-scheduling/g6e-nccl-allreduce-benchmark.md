@@ -12,7 +12,7 @@
 | 调优后 | `NCCL_SHM_USE_CUDA_MEMCPY=1` → busbw ≈ **10.26 GB/s（×1.84）**，约 x8 链路实际可用带宽的 80%，基本到顶 |
 | 不推荐 | `NCCL_SHM_MEMCPY_MODE=3`：所有尺寸都不如单开 memcpy，1 MB 处甚至比 baseline 慢 27% |
 | 代价 | 小消息延迟 +5 µs（20.5 → 26.0 µs），≤64 KB 无收益 |
-| 跨实例 | g6e 支持 EFA 但**不支持 GPUDirect RDMA**（[aws-ofi-nccl#547](https://github.com/aws/aws-ofi-nccl/issues/547)），跨机经主机内存中转，社区实测约 3 GB/s；**g7e 多卡规格官方支持 GDR + P2P** |
+| 跨实例 | g6e 支持 EFA 但**不支持 GPUDirect RDMA**（[aws-ofi-nccl#547](https://github.com/aws/aws-ofi-nccl/issues/547)），跨机经主机内存中转，社区实测约 3 GB/s；**g7e 多卡规格官方支持 GDR + P2P**，但 P2P 可能**仅限同一 PCIe switch 内**（见 7.2.1） |
 | 选型 | 适合单卡多副本 / LoRA / 出图 / Embedding / 少通信负载；**强 TP 推理、全参训练建议 NVLink 机型（p5/p5e/p6）** |
 
 ---
@@ -316,7 +316,89 @@ NCCL_DEBUG=INFO <启动命令> 2>&1 | grep -E "NCCL_SHM_USE_CUDA_MEMCPY|via SHM"
 | g7e.24xlarge | 4 | 384 GB | 96 | 1024 GiB | 800 Gbps | 2 | g6e.24xlarge 200 Gbps |
 | g7e.48xlarge | 8 | 768 GB | 192 | 2048 GiB | 1600 Gbps | 4 | g6e.48xlarge 400 Gbps |
 
-> **推断（待实测）**：g6e 单机 memcpy 后约 10 GB/s，按官方"最高 ×4"估算，g7e 单机 4 卡 busbw 可能在 **~40 GB/s** 量级，和 8× RTX 5090 裸金属实测 40.5 GB/s 接近（两者都是 Gen5 + P2P、无 NVLink）。g7e 的 PCIe 宽度、`topo -p2p r` 结果、GDR 是否默认生效都还需要上机确认。
+> **推断（待实测）**：g6e 单机 memcpy 后约 10 GB/s，按官方"最高 ×4"估算，**同一 PCIe switch 内**的卡对 busbw 可能在 **~40 GB/s** 量级，和 8× RTX 5090 裸金属实测 40.5 GB/s 接近（两者都是 Gen5 + P2P、无 NVLink）。**跨 switch 的情况见 7.2.1**，4/8 卡整体数值大概率达不到这个量级。
+
+#### 7.2.1 ⚠️ g7e 的 P2P 可能只在同一 PCIe switch 内生效
+
+**信息来源与可信度**
+
+| 类型 | 内容 |
+|---|---|
+| 官方原话（博客） | *"These instances offer the lowest peer to peer latency for GPUs **on the same PCIe switch**."* |
+| 官方原话（产品页） | *"supports NVIDIA GPUDirect P2P via PCIe"*，没有说明是否所有卡对都支持 |
+| 一线反馈（未见于官方文档） | 只有同一 PCIe switch 下的 GPU 能 P2P direct；**跨 switch 的 P2P 被平台禁用** |
+| 状态 | **推断，待上机确认**（`topo -p2p r` + NCCL `via` 日志） |
+
+**原理：为什么同 switch 能直连，跨 switch 不行**
+
+```
+              CPU Root Complex / IOMMU        ← 跨 switch 的 P2P 必须上行到这里
+               /                    \
+        PCIe Switch A            PCIe Switch B
+         /    |    \              /    |    \
+      GPU0  GPU1  EFA0         GPU2  GPU3  EFA1
+       └─ P2P ─┘                  └─ P2P ─┘     switch 内直接转发 TLP，不经过 CPU
+            GPU1 ↔ GPU2：要经过 Root Complex → 平台禁用 → NCCL 退回 SHM
+```
+
+| 路径 | 数据怎么走 | 云上为什么容易被关 |
+|---|---|---|
+| 同一 switch（`PIX`） | switch 内直接转发 | 不经过 IOMMU，隔离风险可控，性能最好 |
+| 跨 switch、同一 CPU（`NODE`） | 上行到 Root Complex，经 IOMMU 转换后再下行 | ① 为了隔离 VM，ACS 会把 P2P 流量重定向到 IOMMU 检查；② 服务器 CPU 的 Root Complex 转发 P2P 时，性能和稳定性经常不如走主机内存；③ NVIDIA 驱动把这条路径列为需要平台单独确认 |
+| 跨 CPU（`SYS`，48xl 双路） | 还要再经过 UPI 等 socket 间互联 | 基本不可用 |
+
+结论：和 g6e 一样，这是**平台层（Nitro/hypervisor）的策略，用户侧打不开**。`NCCL_P2P_LEVEL=SYS`、`NCCL_P2P_DISABLE=0` 都没用。区别在于 g6e 全部卡对都关了，g7e 只放开了 switch 内部。
+
+**推测拓扑（待实测）**：EFA 和 NVMe 的数量与 switch 数量对得上（24xl：2 EFA、2 NVMe；48xl：4 EFA、4 NVMe），所以很可能**每个 switch 下挂 2 张 GPU + 1 块 EFA + 1 块 NVMe**：
+
+| 规格 | 推测 switch 数 | P2P 可直连的组 |
+|---|---|---|
+| g7e.12xlarge（2 卡） | 1 | {0,1} 全部直连 |
+| g7e.24xlarge（4 卡） | 2 | {0,1}、{2,3} |
+| g7e.48xlarge（8 卡） | 4（可能分布在 2 个 CPU 上） | {0,1}、{2,3}、{4,5}、{6,7} |
+
+**对负载的影响**
+
+| 场景 | 预期 |
+|---|---|
+| TP=2，两张卡在同一 switch | 全程 P2P，最优 |
+| TP=4 / TP=8 | 环路中有一段走 SHM。Ring AllReduce 的带宽由最慢的一段决定，**整体会被 SHM 那段拉低**。NCCL 日志中会同时出现 `via P2P/CUMEM` 和 `via SHM` |
+| vLLM custom allreduce | 要求所有 TP rank 两两都能 P2P。跨 switch 时自动关闭，退回 NCCL |
+| 官方"卡间带宽 4 倍" | 很可能指 switch 内的 P2P，或者 CPU↔GPU 带宽，**不能当作 TP=8 的整体带宽** |
+| 跨 switch 的 SHM 段 | 比 g6e 快。官方称 CPU↔GPU 带宽为 g6e 的 4 倍，正好等于 Gen5 x16 与 Gen4 x8 的比值。`NCCL_SHM_USE_CUDA_MEMCPY=1` 在这一段仍然有效，需要做 A/B |
+
+**g7e 选型建议（推断，实测后修订）**
+
+- 首选 **TP=2 × 多副本**（48xl 跑 4 个副本，24xl 跑 2 个），或者 **TP=2 + PP**（同一 switch 内做 TP，跨 switch 做 PP，PP 的通信量小）。
+- 用 `CUDA_VISIBLE_DEVICES` 把同一 switch 下的卡分到一组（先用 `topo -m` 确认哪两张是 `PIX`）。K8s 上要开 Topology Manager，或使用 NVIDIA device plugin 的拓扑感知分配。
+- 必须用 TP=4/8 时（单卡 96 GB 放不下，又不想用 PP），先用客户自己的负载实测 TPOT。
+- 卡间强耦合（TP=8 低延迟、全参训练）仍然要选 NVLink 机型。
+
+**上机验证清单**
+
+```bash
+nvidia-smi topo -m          # 同 switch 显示 PIX；跨 switch 显示 NODE；跨 CPU 显示 SYS
+nvidia-smi topo -p2p r      # 预期：只有 PIX 的卡对是 OK，其余为 NS
+nvidia-smi --query-gpu=index,pci.bus_id,pcie.link.gen.current,pcie.link.width.current --format=csv
+lspci -tv | grep -B3 -A3 -i nvidia     # 看 GPU 和 EFA 挂在哪个 switch 下
+
+# 传输路径：预期 P2P 和 SHM 同时出现
+NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,P2P,SHM ./build/all_reduce_perf -b 8 -e 8M -f 2 -g 8 2>&1 | grep via
+
+# 同 switch 与跨 switch 对比（按 topo -m 结果替换卡号）
+CUDA_VISIBLE_DEVICES=0,1 ./build/all_reduce_perf -b 1M -e 1G -f 2 -g 2   # PIX
+CUDA_VISIBLE_DEVICES=0,2 ./build/all_reduce_perf -b 1M -e 1G -f 2 -g 2   # NODE
+CUDA_VISIBLE_DEVICES=0,4 ./build/all_reduce_perf -b 1M -e 1G -f 2 -g 2   # SYS（48xl）
+
+# 跨 switch 段的 SHM 调优 A/B（8 卡整体）
+for cfg in "" "NCCL_SHM_USE_CUDA_MEMCPY=1"; do
+  echo "=== ${cfg:-baseline} ==="
+  timeout 300 env $cfg ./build/all_reduce_perf -b 8 -e 1G -f 2 -g 8 -n 20 2>&1 | grep -E "Avg bus"
+done
+
+# 参考：nvbandwidth 卡对矩阵，直接看出哪些卡对是直连
+./nvbandwidth -t device_to_device_memcpy_read_ce
+```
 
 ### 7.3 怎么验证有没有走 GDR
 
@@ -347,7 +429,7 @@ mpirun -np 8 -N 4 --hostfile hosts \
 | 场景 | g6e | g7e | P 系列（p5/p5e/p6） |
 |---|---|---|---|
 | 多副本推理，副本间不通信 | ✅ 性价比高 | ✅ | 浪费 |
-| 单机 TP（≤4/8 卡） | ⚠️ 只有 SHM，约 10 GB/s | ✅ P2P，PCIe Gen5 | ✅✅ NVLink |
+| 单机 TP（≤4/8 卡） | ⚠️ 只有 SHM，约 10 GB/s | ✅ TP=2（同一 switch 内 P2P）；⚠️ TP=4/8 跨 switch 退回 SHM（见 7.2.1） | ✅✅ NVLink |
 | 跨机 PP / 小规模 DP | ⚠️ 能跑，无 GDR，约 3 GB/s（社区实测） | ✅ GDR + 最高 1600G，适合"小规模多机"（官方表述） | ✅✅ |
 | 跨机 TP / 大规模训练 | ❌ | ⚠️ 规模有限，需实测 | ✅✅ 首选（3200G EFA + GDR + NVLink） |
 
@@ -359,7 +441,7 @@ mpirun -np 8 -N 4 --hostfile hosts \
 |---|---|---|---|---|---|
 | g6e.24xlarge | 4× L40S 48 GB | PCIe Gen4 x8，无 P2P，SHM | 5.5 → **10.3 GB/s**（实测） | ❌（[#547](https://github.com/aws/aws-ofi-nccl/issues/547)） | 本文；200 Gbps / 2 EFA |
 | g6e.48xlarge | 8× L40S（384 GB） | 同上（推断） | 预计相近；8 卡 algbw 更低（÷1.75） | ❌ | 192 vCPU / 1.5 TB / 400 Gbps EFA，按需约 $30.13/h（us-east-1）；可能跨 NUMA，待实测 |
-| g7e.24xlarge / 48xlarge | 4/8× RTX PRO 6000 96 GB | PCIe Gen5，无 NVLink，**官方支持 GPUDirect P2P** | 待实测；官方称卡间带宽最高为 g6e 的 4 倍 | ✅（官方：多卡规格支持） | 800 / 1600 Gbps EFA，支持 GDS |
+| g7e.24xlarge / 48xlarge | 4/8× RTX PRO 6000 96 GB | PCIe Gen5，无 NVLink，**GPUDirect P2P 可能仅限同一 PCIe switch 内**（跨 switch 退回 SHM，待实测） | 待实测；官方称卡间带宽最高为 g6e 的 4 倍（大概率指 switch 内） | ✅（官方：多卡规格支持） | 800 / 1600 Gbps EFA，支持 GDS |
 | 8× RTX 5090 裸金属（参考） | GB202 32 GB | PCIe Gen5，无 NVLink | ≈ **40.5 GB/s**（torchrun 自测脚本，1 GiB） | — | 推断启用了 P2P；GeForce EULA 限制数据中心部署 |
 | p5 / p5e / p6 | H100 / H200 / B200 | NVLink + NVSwitch | 数百 GB/s | ✅（p4d 起） | 强 TP / 训练首选，3200 Gbps EFA |
 
@@ -393,6 +475,8 @@ done
 
 - [ ] g6e.48xlarge 实测（NUMA 分布、P2P、8 卡 busbw）
 - [ ] g7e P2P 与 PCIe 宽度实测，和 5090 用 nccl-tests 同口径对比
+- [ ] g7e 确认 P2P 是否仅限同一 PCIe switch 内（`topo -p2p r`，PIX/NODE/SYS 卡对分别测带宽）
+- [ ] g7e TP=4/8 下 `NCCL_SHM_USE_CUDA_MEMCPY=1` 的 A/B
 - [ ] 5090 的 `topo -p2p r` 与 NCCL `via` 日志确认
 - [ ] nvbandwidth H2D/D2H 实测
 - [ ] g6e 多机 nccl-tests 实测（验证约 3 GB/s 的社区数据）
