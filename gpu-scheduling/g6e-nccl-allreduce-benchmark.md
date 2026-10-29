@@ -165,6 +165,35 @@ NVLink:
   GPU0 ══NVLink/NVSwitch══▶ GPU1   （PCIe 仍在，负责 CPU/网卡/NVMe）
 ```
 
+### 4.1 cudaMemcpy 是什么
+
+`cudaMemcpy` / `cudaMemcpyAsync` 是 CUDA 的基础数据拷贝 API，用于 主机内存 ↔ 显存、显存 ↔ 显存 之间搬数据：
+
+```c
+cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice);   // 主机 → 显存
+cudaMemcpyAsync(dst, src, size, kind, stream);         // 异步版，NCCL 用这个
+```
+
+调用后由 GPU 上的 **Copy Engine（CE，拷贝引擎）** 执行 DMA。CE 是独立于 SM（计算核心）的专用搬运硬件。
+
+### 4.2 `NCCL_SHM_USE_CUDA_MEMCPY` 的含义
+
+无 P2P 时数据要经主机内存中转，问题是"谁把数据搬进/搬出主机内存"：
+
+| | 默认（=0） | `=1` |
+|---|---|---|
+| 谁搬 | NCCL kernel 的 **SM 线程**直接读写主机 pinned 内存（zero-copy） | **CPU proxy 线程**调 `cudaMemcpyAsync`，由 **Copy Engine** DMA |
+| 类比 | 厨师（计算核心）亲自跑仓库，一趟拿几件 | 叫物流车（DMA）整车拉 |
+| 小消息 | ✅ 快，无启动开销 | ❌ 多一次"叫车"，约 +5 µs |
+| 大消息 | ❌ SM 跨 PCIe 小粒度访问效率低，≈5.5 GB/s | ✅ 大块连续 DMA 接近链路上限，≈10.3 GB/s |
+| SM 占用 | 占用 | 基本不占，可与计算重叠 |
+
+对应实测：8 B 20.5 → 26.0 µs（叫车开销）；1 GB 5.58 → 10.26 GB/s（整车效率）。即 **大消息用它，小消息不划算**。
+
+> 该参数只在 NCCL 走 **SHM** 时生效；有 P2P / NVLink 的机器数据 GPU 直传、不经主机内存，设了也无影响。
+
+### 4.3 参数速查
+
 | `NCCL_SHM_USE_CUDA_MEMCPY` | 数据搬运方式 | 特点 |
 |---|---|---|
 | 0（默认） | GPU SM 线程 zero-copy 直接读写主机 pinned 内存 | 延迟低；但 SM 发起的跨 PCIe 小粒度访问效率差，带宽低 |
@@ -174,7 +203,7 @@ NVLink:
 |---|---|
 | 1（默认） | 发送端用 memcpy |
 | 2 | 接收端用 memcpy |
-| 3 | 两端都用 memcpy（本机型实测更差） |
+| 3 | 两端都用 memcpy（每次"叫两趟车"，固定开销翻倍，本机型实测更差） |
 
 > 不要设 `NCCL_SHM_DISABLE=1`：无 P2P 时会退化到 `NET/Socket`，更慢。
 
