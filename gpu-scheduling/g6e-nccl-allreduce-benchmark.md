@@ -12,6 +12,7 @@
 | 调优后 | `NCCL_SHM_USE_CUDA_MEMCPY=1` → busbw ≈ **10.26 GB/s（×1.84）**，约 x8 链路实际可用带宽的 80%，基本到顶 |
 | 不推荐 | `NCCL_SHM_MEMCPY_MODE=3`：所有尺寸都不如单开 memcpy，1 MB 处甚至比 baseline 慢 27% |
 | 代价 | 小消息延迟 +5 µs（20.5 → 26.0 µs），≤64 KB 无收益 |
+| 跨实例 | g6e 支持 EFA 但**不支持 GPUDirect RDMA**（[aws-ofi-nccl#547](https://github.com/aws/aws-ofi-nccl/issues/547)），跨机经主机内存中转，社区实测约 3 GB/s；**g7e 多卡规格官方支持 GDR + P2P** |
 | 选型 | 适合单卡多副本 / LoRA / 出图 / Embedding / 少通信负载；**强 TP 推理、全参训练建议 NVLink 机型（p5/p5e/p6）** |
 
 ---
@@ -269,15 +270,98 @@ NCCL_DEBUG=INFO <启动命令> 2>&1 | grep -E "NCCL_SHM_USE_CUDA_MEMCPY|via SHM"
 
 ---
 
-## 7. 机型对比参考
+## 7. 跨实例通信：EFA 与 GPUDirect RDMA
 
-| 机型 | GPU | 卡间互联 | 4/8 卡 AllReduce busbw | 备注 |
-|---|---|---|---|---|
-| g6e.24xlarge | 4× L40S 48 GB | PCIe Gen4 x8，无 P2P，SHM | 5.5 → **10.3 GB/s**（实测） | 本文 |
-| g6e.48xlarge | 8× L40S（384 GB） | 同上（推断） | 预计相近；8 卡 algbw 更低（÷1.75） | 192 vCPU / 1.5 TB / 400 Gbps EFA，按需约 $30.13/h（us-east-1）；可能跨 NUMA，待实测 |
-| g7e.24xlarge / 48xlarge | 4/8× RTX PRO 6000 96 GB | PCIe Gen5，无 NVLink，官方称支持 P2P | 待实测 | 800 / 1600 Gbps EFA |
-| 8× RTX 5090 裸金属（参考） | GB202 32 GB | PCIe Gen5，无 NVLink | ≈ **40.5 GB/s**（torchrun 自测脚本，1 GiB） | 推断启用了 P2P；GeForce EULA 限制数据中心部署 |
-| p5 / p5e / p6 | H100 / H200 / B200 | NVLink + NVSwitch | 数百 GB/s | 强 TP / 训练首选 |
+> 前面 1–6 节讲**单机内**卡间通信（PCIe / P2P / SHM）。本节讲**多台实例之间**的通信（EFA 网卡），是另一条链路，但根因相似：**g6e 的 GPU 不能直接和外设 DMA**。
+
+### 7.1 g6e：支持 EFA，但不支持 GPUDirect RDMA
+
+官方佐证：[aws/aws-ofi-nccl#547](https://github.com/aws/aws-ofi-nccl/issues/547)（AWS 维护者 bwbarrett 回复）：
+
+| 要点 | 原文含义 |
+|---|---|
+| L40S 芯片本身支持 GDR | 但 **G6e 平台硬件不支持**，因为 G6e 定位单机推理 |
+| 支持 GDR 的机型 | 截至 2025-08：**仅 p4d 及之后的 P 系列**（G7e 于 2026-01 发布，见 7.2） |
+| 没有 GDR 能不能跑 | 能。NCCL 仍正常工作，只是路径变为 **GPU → 主机内存 → EFA 网卡 → 对端主机内存 → GPU** |
+| `FI_EFA_USE_DEVICE_RDMA` | **不要手动设置**。在不支持的平台上强开会直接 abort（如 g4dn.8xlarge） |
+| 提问者实测 | g6e 多机 nccl-tests 最高约 **3 GB/s** busbw |
+
+**和单机 SHM 的关系**：
+
+```
+单机  GPU0 ──PCIe──▶ 主机内存(SHM) ──PCIe──▶ GPU1          （无 P2P）
+跨机  GPU0 ──PCIe──▶ 主机内存 ──▶ EFA ══网络══▶ EFA ──▶ 主机内存 ──PCIe──▶ GPU1   （无 GDR）
+```
+
+两者都多了一次"经主机内存中转"，CPU 内存带宽和 PCIe x8 链路成为瓶颈。区别是：单机可以用 `NCCL_SHM_USE_CUDA_MEMCPY=1` 把搬运交给 Copy Engine 来提速；跨机没有对应的用户侧开关可以绕过。
+
+### 7.2 g7e：官方支持 GPUDirect P2P + GPUDirect RDMA（EFA）
+
+来源：[AWS News Blog — Announcing Amazon EC2 G7e instances](https://aws.amazon.com/blogs/aws/announcing-amazon-ec2-g7e-instances-accelerated-by-nvidia-rtx-pro-6000-blackwell-server-edition-gpus/)（2026-01-20）
+
+| 能力 | 官方表述 | 对比 g6e |
+|---|---|---|
+| GPU | RTX PRO 6000 Blackwell Server Edition，96 GB/卡 | 显存 ×2，显存带宽 ×1.85 |
+| 单机卡间 | **支持 GPUDirect P2P**（走 PCIe）；同一 PCIe switch 下的 GPU 之间 P2P 延迟最低 | 卡间带宽 **最高 ×4**（g6e 无 P2P，只能 SHM） |
+| 跨机网络 | 最高 1600 Gbps；**多卡规格支持 GPUDirect RDMA over EFA** | 网络带宽 ×4，并且 g6e 不支持 GDR |
+| 存储 | 多卡规格支持 GPUDirect Storage + FSx for Lustre，最高 1.2 Tbps | 加快模型加载 |
+| 推理性能 | 最高为 G6e 的 2.3 倍 | — |
+| 上线区域 | us-east-1、us-east-2（发布时） | — |
+
+规格（官方博客，网络/EFA 已用 `aws ec2 describe-instance-types` 核对）：
+
+| 规格 | GPU | 显存 | vCPU | 内存 | 网络 | EFA 接口 | 对应 g6e 网络 |
+|---|---|---|---|---|---|---|---|
+| g7e.12xlarge | 2 | 192 GB | 48 | 512 GiB | 400 Gbps | 1 | g6e.12xlarge 100 Gbps |
+| g7e.24xlarge | 4 | 384 GB | 96 | 1024 GiB | 800 Gbps | 2 | g6e.24xlarge 200 Gbps |
+| g7e.48xlarge | 8 | 768 GB | 192 | 2048 GiB | 1600 Gbps | 4 | g6e.48xlarge 400 Gbps |
+
+> **推断（待实测）**：g6e 单机 memcpy 后约 10 GB/s，按官方"最高 ×4"估算，g7e 单机 4 卡 busbw 可能在 **~40 GB/s** 量级，和 8× RTX 5090 裸金属实测 40.5 GB/s 接近（两者都是 Gen5 + P2P、无 NVLink）。g7e 的 PCIe 宽度、`topo -p2p r` 结果、GDR 是否默认生效都还需要上机确认。
+
+### 7.3 怎么验证有没有走 GDR
+
+```bash
+# 1) EFA 设备是否可见
+fi_info -p efa -t FI_EP_RDM | head
+
+# 2) NCCL 选中的网络插件与是否 GDR
+NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET <你的多机命令> 2>&1 | grep -E "NET/OFI|NET/Libfabric|Using network|GDRDMA|GDR"
+#   有 GDR：通道日志里出现  via NET/Libfabric/0/GDRDMA
+#   无 GDR：只有          via NET/Libfabric/0        （g6e 上就是这种）
+#   退化到 TCP：           Using network Socket       （说明 aws-ofi-nccl 插件没加载，需检查 LD_LIBRARY_PATH / DLAMI 环境）
+
+# 3) 多机 nccl-tests（2 台 × 4 卡示例）
+mpirun -np 8 -N 4 --hostfile hosts \
+  -x LD_LIBRARY_PATH -x FI_PROVIDER=efa -x NCCL_DEBUG=INFO \
+  --mca pml ^cm --mca btl tcp,self --bind-to none \
+  ./build/all_reduce_perf -b 8 -e 4G -f 2 -g 1
+```
+
+注意：
+- 不要设置 `FI_EFA_USE_DEVICE_RDMA=1`，新版本 aws-ofi-nccl 会自动探测。
+- 多机实例要放在同一个 **Cluster Placement Group**，安全组需要放行组内所有流量（EFA 要求 self-referencing 规则）。
+- 每块 EFA 网卡都要挂载（g6e.24x / g7e.24x 各 2 个，48x 各 4 个），否则带宽只有一部分。
+
+### 7.4 跨机场景选型口径
+
+| 场景 | g6e | g7e | P 系列（p5/p5e/p6） |
+|---|---|---|---|
+| 多副本推理，副本间不通信 | ✅ 性价比高 | ✅ | 浪费 |
+| 单机 TP（≤4/8 卡） | ⚠️ 只有 SHM，约 10 GB/s | ✅ P2P，PCIe Gen5 | ✅✅ NVLink |
+| 跨机 PP / 小规模 DP | ⚠️ 能跑，无 GDR，约 3 GB/s（社区实测） | ✅ GDR + 最高 1600G，适合"小规模多机"（官方表述） | ✅✅ |
+| 跨机 TP / 大规模训练 | ❌ | ⚠️ 规模有限，需实测 | ✅✅ 首选（3200G EFA + GDR + NVLink） |
+
+---
+
+## 8. 机型对比参考
+
+| 机型 | GPU | 卡间互联 | 4/8 卡 AllReduce busbw | 跨机 GDR | 备注 |
+|---|---|---|---|---|---|
+| g6e.24xlarge | 4× L40S 48 GB | PCIe Gen4 x8，无 P2P，SHM | 5.5 → **10.3 GB/s**（实测） | ❌（[#547](https://github.com/aws/aws-ofi-nccl/issues/547)） | 本文；200 Gbps / 2 EFA |
+| g6e.48xlarge | 8× L40S（384 GB） | 同上（推断） | 预计相近；8 卡 algbw 更低（÷1.75） | ❌ | 192 vCPU / 1.5 TB / 400 Gbps EFA，按需约 $30.13/h（us-east-1）；可能跨 NUMA，待实测 |
+| g7e.24xlarge / 48xlarge | 4/8× RTX PRO 6000 96 GB | PCIe Gen5，无 NVLink，**官方支持 GPUDirect P2P** | 待实测；官方称卡间带宽最高为 g6e 的 4 倍 | ✅（官方：多卡规格支持） | 800 / 1600 Gbps EFA，支持 GDS |
+| 8× RTX 5090 裸金属（参考） | GB202 32 GB | PCIe Gen5，无 NVLink | ≈ **40.5 GB/s**（torchrun 自测脚本，1 GiB） | — | 推断启用了 P2P；GeForce EULA 限制数据中心部署 |
+| p5 / p5e / p6 | H100 / H200 / B200 | NVLink + NVSwitch | 数百 GB/s | ✅（p4d 起） | 强 TP / 训练首选，3200 Gbps EFA |
 
 **选型三问：**
 1. **放不下？**（单卡显存不够）→ 需要多卡，优先 PP 而不是 TP
@@ -286,7 +370,7 @@ NCCL_DEBUG=INFO <启动命令> 2>&1 | grep -E "NCCL_SHM_USE_CUDA_MEMCPY|via SHM"
 
 ---
 
-## 8. 复现清单
+## 9. 复现清单
 
 ```bash
 # 拓扑
@@ -311,4 +395,6 @@ done
 - [ ] g7e P2P 与 PCIe 宽度实测，和 5090 用 nccl-tests 同口径对比
 - [ ] 5090 的 `topo -p2p r` 与 NCCL `via` 日志确认
 - [ ] nvbandwidth H2D/D2H 实测
+- [ ] g6e 多机 nccl-tests 实测（验证约 3 GB/s 的社区数据）
+- [ ] g7e 多机 GDR 实测（日志中确认 `GDRDMA`）
 - [ ] 客户真实负载（vLLM TTFT/TPOT、训练 step time）开/关对比
