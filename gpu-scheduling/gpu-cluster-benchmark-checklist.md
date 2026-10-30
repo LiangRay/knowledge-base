@@ -315,6 +315,45 @@ time s5cmd --numworkers 64 cp 's3://<bucket>/<model-prefix>/*' /mnt/nvme/model/
 
 GDS（cuFile）让存储（NVMe / Lustre）直接通过 DMA 读写 GPU 显存，**不经过主机内存中转**。如果条件不满足，它会**自动退到兼容模式**（数据先到主机内存再拷贝到 GPU）：程序照常运行、不会报错，只是吞吐变低、CPU 占用变高。所以"能跑"不等于"GDS 生效"。
 
+**数据路径对比**
+
+| | 路径 | 拷贝次数 |
+|---|---|---|
+| 无 GDS | 存储 → CPU 内存（page cache / pinned bounce buffer）→ `cudaMemcpy` → GPU | 2 次，CPU 参与 |
+| 有 GDS | 存储（NVMe / EFA 网卡）→ GPU 显存（DMA；在同一 PCIe switch 下还可不经 CPU root complex） | 1 次，CPU 只负责发起 |
+
+**优势**（前提：瓶颈在主机侧——CPU、内存带宽、多出来的那次拷贝；而不在存储本身或 GPU 的 PCIe 链路）
+
+| 优势 | 原因 | 什么时候明显 |
+|---|---|---|
+| 吞吐更高 | 少一次拷贝，不受 CPU 内存带宽和 bounce buffer 限制 | 8 卡同时读、抢 CPU 内存带宽 |
+| 延迟更低 | 少一跳，没有 page cache 管理开销 | 小块随机读（如 KV cache 回读） |
+| 释放 CPU | CPU 不搬数据，可以做预处理、增强、tokenize | 数据加载占满 CPU、GPU 等数据 |
+| 主机内存占用少 | 不需要大块 pinned buffer / page cache | 主机内存紧张、多进程并发读 |
+| 多卡扩展更线性 | 每张卡走就近的 NVMe / 网卡，不都挤到 CPU | P5/P6 这类 GPU、NVMe、EFA 同挂一个 PCIe switch 的拓扑 |
+
+**收益明显的场景**
+- Checkpoint 保存 / 恢复：上百 GB 到 TB 级，8 卡并发，缩短停顿和故障恢复时间。
+- 推理冷启动、模型热切换：权重从 NVMe / FSx 直接进显存。
+- KV cache 卸载到存储：回读延迟和带宽都受益（需要推理框架支持 cuFile / NIXL 等 GDS 后端）。
+- GPU 数据分析与预处理：RAPIDS cuDF 读 Parquet，DALI + nvJPEG 在 GPU 上解码。
+
+**收益有限或没有的场景（容易误判）**
+
+| 情况 | 原因 |
+|---|---|
+| 瓶颈在存储本身 | FSx 吞吐容量配小、NVMe 盘数少，GDS 也提不上去 |
+| 数据必须先在 CPU 上处理 | CPU 解码 JPEG、Python 预处理，数据本来就要进 CPU 内存 |
+| 数据集能完全放进内存 / 显存缓存 | 第二个 epoch 之后就不读存储 |
+| 模型只加载一次、常驻显存 | 只省一次启动时间，对稳态没有影响 |
+| 应用没有调用 cuFile | 普通 `torch.load` / `open()` 不走 GDS，要用 kvikio、DALI、NIXL 等；`gdscheck` 显示 Supported 只代表具备条件 |
+
+> **GDS 不提高 PCIe 链路本身的带宽**：上限是存储吞吐和 GPU PCIe 链路两者中的较小值。例如 g6e 每卡 Gen4 x8（理论约 15.75 GB/s），有 GDS 单卡也不会超过这个值。
+
+**对客户的口径**
+- P5 / P5e / P5en / P6-B200 / P6-B300 + FSx Lustre：官方支持 GDS，可作为 checkpoint 与数据加载加速的卖点【官方】。
+- g7e / g6e：FSx GDS 不在官方名单里，配置脚本也会拦截【官方】；本地 NVMe GDS 未实测。可用替代方案拿到大部分收益：NVMe RAID0 本地缓存 + s5cmd 从 S3 预热；pinned memory + 多流 `cudaMemcpyAsync`；safetensors mmap / Run:ai Model Streamer 并发加载权重。
+
 **机型支持情况**（2026-10 核对 AWS 文档）
 
 | 存储 | p5 / p5e / p5en / p6-b200 / p6-b300 | g7e | g6e |
