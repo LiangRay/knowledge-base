@@ -319,12 +319,20 @@ GDS（cuFile）让存储（NVMe / Lustre）直接通过 DMA 读写 GPU 显存，
 
 | 存储 | p5 / p5e / p5en / p6-b200 / p6-b300 | g7e | g6e |
 |---|---|---|---|
-| FSx for Lustre + GDS（基于 EFA） | ✅ 【官方】FSx 文档列出的 GDS client 实例 | ❌ 【官方】未列入名单 | ❌ 未列入名单 |
+| FSx for Lustre + GDS（基于 EFA） | ✅ 【官方】FSx 文档列出的 GDS client 实例 | ❌ 【官方】未列入名单，配置脚本也会拦截 | ❌ 未列入名单，配置脚本也会拦截 |
 | 本地 NVMe instance store + GDS | AWS 未明确说明，需实测 | AWS 未明确说明，需实测 | 需实测（机内 GPU P2P 都是 NS，直通的可能性很低） |
 
 - 【官方】FSx 文档（efa-file-systems）原文：*"To access your file system using GPUDirect Storage (GDS): Use an Amazon EC2 P5, P5e, P5en, P6-B200, or P6-B300 client instance."*
 - 【官方】EC2 EFA 文档：g7e.12xl / 24xl / 48xl 属于 Nitro v6（EFA v4），RDMA read 和 write 都标为 Yes（g7e.8xl 两项都是 No）。
 - 【推断】g7e 底层具备 RDMA 能力，FSx GDS 名单里没有它，可能只是尚未验证或文档未更新，不一定是硬件不支持。客户如果需要，**找 FSx 或实例产品团队确认**。
+- 【官方脚本源码】FSx 提供的 EFA 客户端配置包（[configure-efa-fsx-lustre-client.zip](https://docs.aws.amazon.com/fsx/latest/LustreGuide/samples/configure-efa-fsx-lustre-client.zip)，2026-10 下载）在 `bin/configure-efa-fsx-lustre-client.py` 里**写死了机型白名单**：
+  ```python
+  GDS_SUPPORTED_INSTANNCES = ["p5.48xlarge", "p5e.48xlarge", "p5en.48xlarge",
+                              "p6-b200.48xlarge", "p6-b300.48xlarge"]
+  # filter_efa_gds(): 机型不在名单中 → RuntimeError("... does not support Lustre GDS.")
+  ```
+  因此在 g7e / g6e 上运行 `sudo ./setup.sh --optimized-for-gds` 会**直接报错退出**。去掉这个参数只运行 `sudo ./setup.sh`，配置的是普通 EFA 加速的 Lustre IO（数据仍经过 CPU 内存，不是 GDS）。注意：p6e-gb200 在脚本的 EFA 机型列表里，但**不在** GDS 白名单里。
+- 【区分】`setup.sh` 是 **FSx Lustre 客户端配置**（加载 Lustre 模块、配置 TCP/EFA 接口、注册开机 systemd 服务），`gdscheck -p` 是 **GDS 环境自检**（检查 nvidia_fs、各文件系统和 GPU 的支持状态、cufile.json 配置）。两者都**不是性能验证**。要确认 GDS 真正生效，只能看下面 `gdsio` 的 `-x 0` 与 `-x 2` 对比。
 - 【API 实测】g7e.48xl 带 4 × 3.8 TB 本地 NVMe（共 15.2 TB），是 Nitro 虚拟机，不是裸金属。NVMe 到 GPU 的 P2P DMA 能不能走通，取决于 PCIe 拓扑以及虚拟化层是否放行。另有一线反馈说 g7e 的 GPU 间 P2P 只在同一个 PCIe switch 下可用，所以 NVMe→GPU 也需要实测。
 - 【待确认】RTX PRO 6000 Server Edition 是否在 NVIDIA GDS 支持列表里，要对照所装 CUDA / GDS 版本的 release notes。
 
