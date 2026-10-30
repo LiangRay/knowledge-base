@@ -311,12 +311,42 @@ curl -sL https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linu
 time s5cmd --numworkers 64 cp 's3://<bucket>/<model-prefix>/*' /mnt/nvme/model/
 ```
 
-### 5.4 GPUDirect Storage（可选，仅支持 GDS 的机型和文件系统）
+### 5.4 GPUDirect Storage（GDS，可选，仅部分机型和文件系统支持）
+
+GDS（cuFile）让存储（NVMe / Lustre）直接通过 DMA 读写 GPU 显存，**不经过主机内存中转**。如果条件不满足，它会**自动退到兼容模式**（数据先到主机内存再拷贝到 GPU）：程序照常运行、不会报错，只是吞吐变低、CPU 占用变高。所以"能跑"不等于"GDS 生效"。
+
+**机型支持情况**（2026-10 核对 AWS 文档）
+
+| 存储 | p5 / p5e / p5en / p6-b200 / p6-b300 | g7e | g6e |
+|---|---|---|---|
+| FSx for Lustre + GDS（基于 EFA） | ✅ 【官方】FSx 文档列出的 GDS client 实例 | ❌ 【官方】未列入名单 | ❌ 未列入名单 |
+| 本地 NVMe instance store + GDS | AWS 未明确说明，需实测 | AWS 未明确说明，需实测 | 需实测（机内 GPU P2P 都是 NS，直通的可能性很低） |
+
+- 【官方】FSx 文档（efa-file-systems）原文：*"To access your file system using GPUDirect Storage (GDS): Use an Amazon EC2 P5, P5e, P5en, P6-B200, or P6-B300 client instance."*
+- 【官方】EC2 EFA 文档：g7e.12xl / 24xl / 48xl 属于 Nitro v6（EFA v4），RDMA read 和 write 都标为 Yes（g7e.8xl 两项都是 No）。
+- 【推断】g7e 底层具备 RDMA 能力，FSx GDS 名单里没有它，可能只是尚未验证或文档未更新，不一定是硬件不支持。客户如果需要，**找 FSx 或实例产品团队确认**。
+- 【API 实测】g7e.48xl 带 4 × 3.8 TB 本地 NVMe（共 15.2 TB），是 Nitro 虚拟机，不是裸金属。NVMe 到 GPU 的 P2P DMA 能不能走通，取决于 PCIe 拓扑以及虚拟化层是否放行。另有一线反馈说 g7e 的 GPU 间 P2P 只在同一个 PCIe switch 下可用，所以 NVMe→GPU 也需要实测。
+- 【待确认】RTX PRO 6000 Server Edition 是否在 NVIDIA GDS 支持列表里，要对照所装 CUDA / GDS 版本的 release notes。
+
+**测试方法**
 
 ```bash
-/usr/local/cuda/gds/tools/gdscheck -p                       # 检查 GDS 是否可用
-/usr/local/cuda/gds/tools/gdsio -D /mnt/nvme -d 0 -w 8 -s 4G -i 1M -x 0 -I 0   # -x 0 走 GPU_DIRECT，-x 1 走 CPU 中转，两者对比
+# 安装 nvidia-gds（包含 nvidia-fs 内核模块），然后：
+lsmod | grep nvidia_fs
+/usr/local/cuda/gds/tools/gdscheck -p        # 看 NVMe / Lustre 各行是 Supported 还是 Unsupported，以及是否提示 compat mode
+
+# 同一个文件、同样参数，只换传输模式做对比
+# -x 0 = GPU_DIRECT（GDS 直通）  -x 1 = CPU_ONLY（不涉及 GPU）  -x 2 = CPU_GPU（读到主机内存再 cudaMemcpy 到 GPU）
+/usr/local/cuda/gds/tools/gdsio -D /mnt/nvme -d 0 -w 8 -s 4G -i 1M -x 0 -I 0
+/usr/local/cuda/gds/tools/gdsio -D /mnt/nvme -d 0 -w 8 -s 4G -i 1M -x 2 -I 0
+# 测试时另开一个终端看 CPU 占用：mpstat 1 或 top
 ```
+
+如何解读结果：
+- `-x 0` 吞吐明显高于 `-x 2`、CPU 占用明显更低 → GDS 直通生效。
+- 两者吞吐和 CPU 占用都差不多 → 实际走的是兼容模式。查 `gdscheck -p` 的输出和 `/etc/cufile.json`（例如 `allow_compat_mode`，以及 `logging` 打开后的日志）。
+
+**不支持 GDS 时的替代方案**（g7e / g6e 加载 checkpoint、读训练数据）：本地 NVMe 做 RAID0 当缓存层（数据从 S3 用 s5cmd 预热进来），再用多线程读到 pinned memory，然后 `cudaMemcpyAsync` 拷到 GPU（走 Copy Engine，带宽上限见 ② 的 H2D 测试）。模型加载可以用 safetensors 的 mmap 方式，或者 Run:ai Model Streamer 这类并行加载器。
 
 判断方法：
 - 业务上最直观的指标是**模型冷启动时长**，即从 S3 或 FSx 加载到所有 GPU 可服务为止。
@@ -479,3 +509,6 @@ chmod +x ~/bench/quick_bench.sh && ~/bench/quick_bench.sh
 - [ ] 在 g7e 上跑 ③ 的分组测试，验证跨 switch 时 P2P 是否被禁用
 - [ ] 补测 2 台 g6e 的跨机 NCCL（验证社区给出的约 3 GB/s）
 - [ ] 推理场景下 TP=4 与 4 × TP=1 吞吐的实测对比
+- [ ] 在 g7e.48xl 上测本地 NVMe 的 GDS：gdscheck 结果，以及 gdsio -x 0 与 -x 2 的对比
+- [ ] 向 AWS 确认 g7e 能否作为 FSx for Lustre GDS client（目前官方文档只列了 P5 / P6）
+- [ ] 2 台 g7e.48xl（4 × EFA，加 placement group）跨机 NCCL，确认日志出现 `GDRDMA` 并记录 busbw
