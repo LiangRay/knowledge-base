@@ -2,7 +2,8 @@ import asyncio, json, sys, time
 from mcp import ClientSession
 from mcp_proxy_for_aws.client import aws_iam_streamablehttp_client
 
-URL = "https://bedrock-search-gw-v2tagaojws.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
+import os
+URL = os.environ["AGENTCORE_GW_URL"]  # https://<gateway-id>.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp
 
 async def main(query, n):
     async with aws_iam_streamablehttp_client(endpoint=URL, aws_region="us-east-1", aws_service="bedrock-agentcore") as (r, w, _):

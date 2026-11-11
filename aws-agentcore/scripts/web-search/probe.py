@@ -2,7 +2,8 @@ import asyncio, json, time
 from mcp import ClientSession
 from mcp_proxy_for_aws.client import aws_iam_streamablehttp_client
 
-URL = "https://bedrock-search-gw-v2tagaojws.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
+import os
+URL = os.environ["AGENTCORE_GW_URL"]  # https://<gateway-id>.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp
 CASES = [
     ("中文", "理想汽车 自研芯片 最新进展", 5),
     ("时效", "stock market news today", 5),

@@ -4,7 +4,8 @@ from strands.models.bedrock import BedrockModel
 from strands.tools.mcp import MCPClient
 from mcp_proxy_for_aws.client import aws_iam_streamablehttp_client
 
-URL = "https://bedrock-search-gw-v2tagaojws.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp"
+import os
+URL = os.environ["AGENTCORE_GW_URL"]  # https://<gateway-id>.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp
 MODEL = sys.argv[2] if len(sys.argv) > 2 else "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 mcp = MCPClient(lambda: aws_iam_streamablehttp_client(endpoint=URL, aws_region="us-east-1", aws_service="bedrock-agentcore"))
