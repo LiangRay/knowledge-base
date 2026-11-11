@@ -1,5 +1,8 @@
 # Amazon Bedrock AgentCore Web Search 学习总结
 
+> 📌 2026-11 更新：InvokeWebSearch API、Codex 通过 MCP 接入、mcp-proxy-for-aws 原理见 [agentcore-web-search-api-and-codex-mcp.md](agentcore-web-search-api-and-codex-mcp.md)
+
+
 > 学习日期：2026-07-14  
 > 参考资料：  
 > - [AWS Blog: Add web search and browsing to your agents with Amazon Bedrock AgentCore](https://aws.amazon.com/cn/blogs/china/leveraging-amazon-bedrock-agentcore-quick-en/)  
