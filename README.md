@@ -10,6 +10,7 @@
 - [g7e PD 分离测试方案（同机 1P1D → 跨机 EFA/GDR/NIXL）+ 一键脚本](gpu-scheduling/g7e-pd-disagg-test/README.md)
 - [LiteLLM Proxy 路由机制深度指南](litellm/litellm-proxy-routing-guide.md)
 - [GPT 推理模型跨供应商路由：encrypted_content 问题与 Hook 丢弃方案](litellm/gpt-encrypted-content-cross-provider.md)
+  - [讲解版：为什么要在网关丢弃加密 reasoning](litellm/encrypted-reasoning-strip-explained.md)
 - [Claude Code 接入第三方模型：Anthropic Messages API 兼容生态](claude-code/anthropic-compatible-providers.md)
 - [拆开一个 Agent Sandbox：架构、场景和形态（含 Google ACE / AgentCore 映射）](agent-sandbox/agent-sandbox-architecture.md)
 - [AgentCore Web Search 实测：InvokeWebSearch API + Codex 通过 MCP 联网 + mcp-proxy-for-aws 原理](aws-agentcore/agentcore-web-search-api-and-codex-mcp.md)
