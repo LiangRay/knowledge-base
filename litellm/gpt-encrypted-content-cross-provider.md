@@ -153,6 +153,70 @@ router_settings:
 
 代码：[`hooks/strip_all_reasoning.py`](hooks/strip_all_reasoning.py)、[`hooks/encrypted_reasoning_guard.py`](hooks/encrypted_reasoning_guard.py)
 
+#### 5a 全扔：操作步骤（Docker Compose 部署）
+
+**1. 写 hook 文件**，放在 compose 目录下（与 `config.yaml` 同级），文件名 `strip_all_reasoning.py`：
+
+```python
+"""路由前无条件丢掉 Responses API input 里所有 reasoning item（含 encrypted_content）。"""
+from litellm._logging import verbose_logger
+from litellm.integrations.custom_logger import CustomLogger
+
+
+class StripAllReasoning(CustomLogger):
+    async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+        inp = data.get("input")          # 只有 /v1/responses 请求有 input 列表
+        if isinstance(inp, list):
+            kept = [i for i in inp
+                    if not (isinstance(i, dict) and i.get("type") == "reasoning")]
+            if len(kept) != len(inp):
+                verbose_logger.warning("[strip_all] dropped %d reasoning items",
+                                       len(inp) - len(kept))
+                data["input"] = kept
+        return data                      # 必须返回 data，否则修改不生效
+
+
+strip_all_instance = StripAllReasoning()   # config.yaml 里引用的是这个实例名
+```
+
+**2. 挂载进容器**（`docker-compose.yml`，LiteLLM 会从 `/app/` 下按模块名导入）：
+
+```yaml
+services:
+  litellm:
+    volumes:
+      - ./config.yaml:/app/config.yaml
+      - ./strip_all_reasoning.py:/app/strip_all_reasoning.py
+```
+
+**3. 在 config.yaml 注册 callback**（格式 `模块名.实例名`；已有其他 hook 时追加到列表即可，互不影响）：
+
+```yaml
+litellm_settings:
+  callbacks:
+    - "strip_all_reasoning.strip_all_instance"
+```
+
+**4. 重建容器**（改了 volumes，`restart` 不会生效）：
+
+```bash
+docker compose up -d --force-recreate litellm
+docker compose logs litellm | grep -i "strip_all\|callback"   # 确认加载无报错
+```
+
+**5. 验证**：用带 reasoning 的多轮请求打一次，日志出现 `[strip_all] dropped N reasoning items` 即生效：
+
+```bash
+docker compose logs -f litellm | grep strip_all
+```
+
+要点 / 坑：
+- `async_pre_call_hook` 是 **Proxy 层**钩子，在路由选 deployment **之前**执行，所以只能"无差别全扔"，拿不到最终发往哪个后端（要按需扔用 5b 的 `async_pre_call_deployment_hook`）。
+- 删整个 reasoning item 即可，不要只删 `encrypted_content` 字段留下空壳；两者在 Bedrock 上实测都 200，但空壳 item 在严格上游上行为未验证。
+- 不影响 `function_call` / `function_call_output` / 消息配对，工具调用链完整。
+- 对 Chat Completions 请求无副作用（没有 `input` 列表，直接透传）。
+- 回滚：从 `callbacks` 里删掉这一行再 `--force-recreate`。
+
 挂载方式（与已有 hook 一样，放到 `/app/` 下并在 `litellm_settings.callbacks` 里引用）：
 
 ```yaml
