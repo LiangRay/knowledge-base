@@ -1,0 +1,44 @@
+<!doctype html>
+<!-- 用法：把本页和 h264.mp4 / h264.mov / h264.mkv / hevc.mp4 / vp9.webm / vp8.webm / av1.mp4 / mpeg4.avi / video.flv
+     放到同一个 S3 目录（Content-Type 设对），浏览器打开本页即可逐个检测。 -->
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>S3 视频格式兼容性测试</title>
+<style>
+body{font-family:-apple-system,system-ui,sans-serif;margin:16px;background:#f5f5f5}
+h1{font-size:20px}.ua{font-size:12px;color:#666;word-break:break-all}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px}
+.card{background:#fff;border-radius:8px;padding:10px;box-shadow:0 1px 3px #0002}
+video{width:100%;background:#000;border-radius:4px}
+.t{font-weight:600}.s{font-size:13px;margin-top:4px}
+.ok{color:#0a0}.bad{color:#c00}.wait{color:#888}
+</style></head><body>
+<h1>S3 公开桶 · 视频格式兼容性测试</h1>
+<div class="ua" id="ua"></div>
+<div class="grid" id="g"></div>
+<script>
+const items=[
+ ["h264.mp4","MP4 · H.264 + AAC",'video/mp4; codecs="avc1.640028, mp4a.40.2"'],
+ ["h264.mov","MOV · H.264 + AAC",'video/quicktime'],
+ ["h264.mkv","MKV · H.264 + AAC",'video/x-matroska'],
+ ["hevc.mp4","MP4 · H.265/HEVC + AAC",'video/mp4; codecs="hvc1.1.6.L93.B0, mp4a.40.2"'],
+ ["vp9.webm","WebM · VP9 + Opus",'video/webm; codecs="vp9, opus"'],
+ ["vp8.webm","WebM · VP8 + Opus",'video/webm; codecs="vp8, opus"'],
+ ["av1.mp4","MP4 · AV1 + AAC",'video/mp4; codecs="av01.0.05M.08, mp4a.40.2"'],
+ ["mpeg4.avi","AVI · MPEG-4 Part2 + MP3",'video/x-msvideo'],
+ ["video.flv","FLV · Sorenson + MP3",'video/x-flv'],
+];
+document.getElementById('ua').textContent=navigator.userAgent;
+const g=document.getElementById('g');window.results={};
+for(const [f,label,mime] of items){
+ const c=document.createElement('div');c.className='card';
+ const v=document.createElement('video');v.controls=true;v.muted=true;v.preload='auto';v.playsInline=true;v.src='./'+f;
+ const s=document.createElement('div');s.className='s wait';
+ const cp=v.canPlayType(mime)||'""';
+ s.textContent='canPlayType: '+cp+' · 加载中…';
+ const done=(ok,msg)=>{if(window.results[f])return;window.results[f]={ok,msg,canPlayType:cp};s.className='s '+(ok?'ok':'bad');s.textContent=(ok?'✅ 可播放 ':'❌ 不支持 ')+msg+' · canPlayType: '+cp;};
+ v.addEventListener('loadeddata',()=>done(true,v.videoWidth+'x'+v.videoHeight+' '+v.duration.toFixed(1)+'s'));
+ v.addEventListener('error',()=>done(false,'error code '+(v.error&&v.error.code)));
+ setTimeout(()=>done(false,'超时'),15000);
+ c.innerHTML='<div class="t">'+label+'</div><div class="s">'+f+'</div>';c.appendChild(v);c.appendChild(s);g.appendChild(c);
+}
+</script></body></html>

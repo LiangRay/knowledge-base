@@ -14,4 +14,5 @@
 - [Claude Code 接入第三方模型：Anthropic Messages API 兼容生态](claude-code/anthropic-compatible-providers.md)
 - [拆开一个 Agent Sandbox：架构、场景和形态（含 Google ACE / AgentCore 映射）](agent-sandbox/agent-sandbox-architecture.md)
 - [AgentCore Web Search 实测：InvokeWebSearch API + Codex 通过 MCP 联网 + mcp-proxy-for-aws 原理](aws-agentcore/agentcore-web-search-api-and-codex-mcp.md)
+- [S3 视频在线播放：手动配置手册（公开桶 + 格式兼容性实测 + CloudFront OAC 建议）](s3-video/s3-public-video-manual-setup.md)
 - [智驾专利解读：整车平台与车队运营（Waymo Gen 6 × 小鹏 BEV+Transformer 端到端）](autonomous-driving/patent-review-vehicle-platform-and-fleet-ops.md)
