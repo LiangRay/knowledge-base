@@ -17,3 +17,4 @@
 - [S3 视频在线播放：手动配置手册（公开桶 + 格式兼容性实测 + CloudFront OAC 建议）](s3-video/s3-public-video-manual-setup.md)
 - [拉专线到 AWS：Direct Connect 专用连接 + 机房交叉连接全流程（LOA-CFA 解读、工单核对、排障）](direct-connect/dx-dedicated-connection-cross-connect-guide.md)
 - [智驾专利解读：整车平台与车队运营（Waymo Gen 6 × 小鹏 BEV+Transformer 端到端）](autonomous-driving/patent-review-vehicle-platform-and-fleet-ops.md)
+- [智驾数据脱敏：每天 1 万 bag 的人脸/车牌打码方案、GPU 估算与 PoC](autonomous-driving/data-anonymization/README.md)
