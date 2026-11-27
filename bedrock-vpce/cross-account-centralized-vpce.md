@@ -175,7 +175,97 @@ fields @timestamp, srcaddr, dstaddr, dstport, action
 - **区域要对**：VPCE 要建在 DX 落地的 EU 区域（如 eu-central-1），模型用 `eu.` 推理配置文件。
 - **换机器要改三处**：LiteLLM 迁移、扩容或改 IP 时，安全组、VPCE 策略、B/C 的 IAM 策略都要同步改。建议写成 CIDR 变量，用 IaC 统一管理。
 - **多台 LiteLLM 时**：写一个专用的小网段（如 `/28`），不要逐个写 /32。
-- **待实测**：Bedrock 对 `aws:VpcSourceIp` 的支持情况还没有实测，上线前按第 8 节的第 6、7 项验证。
+- **已实测**：Bedrock 支持 `aws:VpcSourceIp`，结果见下面的"实测记录"。客户环境上线前仍要按第 8 节的第 6、7 项再验证一次。
+
+### 实测记录（us-west-2，2026-11）
+
+做法：建一个临时 IAM 角色，挂上"Allow Converse/InvokeModel + Deny `NotIpAddress aws:VpcSourceIp`"，用 Claude Haiku 4.5 调用 Converse。
+
+| # | 调用路径 | 白名单 IP | 结果 |
+|---|---|---|---|
+| 1 | 走 VPCE 专属域名 | 调用主机的私网 IP | ✅ 返回 ok |
+| 2 | 走公网（FIPS 公网域名，不经过 VPCE） | 调用主机的私网 IP | ❌ AccessDeniedException |
+| 3 | 走 VPCE | 故意写错的 IP | ❌ AccessDeniedException |
+| 4 | 把白名单改回调用主机的 IP，再走 VPCE | 调用主机的私网 IP | ✅ 返回 ok |
+
+结论：
+- Bedrock Runtime 的请求上下文里带有 `aws:VpcSourceIp`，可以用来做 IAM 判断。
+- 修改 IAM 策略后，十几秒内生效。
+- 不经过 VPCE 时这个键不存在，`NotIpAddress` 判定为"真"，所以请求被拒（第 2 项）。这条 Deny 本身也能挡住公网调用，但仍然建议再加一条 `aws:SourceVpce` 的 Deny，防止有人在别的 VPC 里用相同网段绕过。
+- 实测对象是 IAM 角色。IAM 用户的 AK/SK 用的是同一套条件判断，策略写法一样。
+
+### 客户用 IAM 用户 AK/SK 时：完整策略模板
+
+**情况一：IDC 经专线 + VPCE 访问（推荐）**
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowBedrockInvoke",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream",
+        "bedrock:Converse",
+        "bedrock:ConverseStream"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyIfNotViaOurVpce",
+      "Effect": "Deny",
+      "Action": "*",
+      "Resource": "*",
+      "Condition": {
+        "StringNotEquals": { "aws:SourceVpce": ["<vpce-runtime-id>", "<vpce-mantle-id>"] }
+      }
+    },
+    {
+      "Sid": "DenyIfNotFromIdc",
+      "Effect": "Deny",
+      "Action": "*",
+      "Resource": "*",
+      "Condition": {
+        "NotIpAddress": { "aws:VpcSourceIp": ["<IDC_LITELLM_CIDR>"] }
+      }
+    }
+  ]
+}
+```
+
+- 两条 Deny 各管一件事：第一条要求必须经过指定的 VPCE，第二条要求源 IP 必须在 IDC 的网段里。**必须分开写**，合成一条会变成"两个都不满足才拒绝"。
+- Deny 的 Action 用 `*`：AK 泄露后，任何 API 都用不了，不只是 Bedrock。
+- IP 写 SNAT 之后的地址，以 Flow Logs 里的 `srcaddr` 为准。
+
+**情况二：IDC 走公网访问（没有专线时）**
+
+```json
+{
+  "Sid": "DenyIfNotFromIdcPublicIp",
+  "Effect": "Deny",
+  "Action": "*",
+  "Resource": "*",
+  "Condition": {
+    "NotIpAddress": { "aws:SourceIp": ["<IDC_PUBLIC_EGRESS_IP>/32"] },
+    "Bool": { "aws:ViaAWSService": "false" }
+  }
+}
+```
+
+- `aws:SourceIp` 是 IDC 的公网出口 IP，最好是固定 IP。
+- **两种写法不能混用**：请求走 VPCE 时没有 `aws:SourceIp`，情况二的写法会把正常请求全部拦掉。走专线用 `aws:VpcSourceIp`，走公网用 `aws:SourceIp`。
+- `aws:ViaAWSService=false`：AWS 服务替客户转发请求时，不受这条 IP 限制影响。
+
+**配套措施**
+
+| 措施 | 作用 |
+|---|---|
+| 这个 IAM 用户只给 LiteLLM 用，不开控制台登录 | 加了 Deny 之后控制台也调不了 Bedrock，防止被挪作他用 |
+| AK 定期轮换（如 90 天） | 缩短泄露后的风险窗口 |
+| CloudTrail + EventBridge：这个 AK 出现 AccessDenied 就告警 | 第一时间发现 AK 被人从别处拿去用 |
+| 多账户时用 SCP 兜底 | 防止有人在 B/C 账户里新建用户绕过限制（需要 Organizations） |
 
 ---
 
