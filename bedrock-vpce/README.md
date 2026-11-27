@@ -2,6 +2,8 @@
 
 通过 VPC Endpoint 私网调用 Amazon Bedrock 模型，流量不经公网。
 
+> 📎 IDC 部署的 LiteLLM 经专线走 VPCE 内网调用 Bedrock（DNS 原理、配置、方案对比）：见 [litellm-idc-via-dx.md](./litellm-idc-via-dx.md)
+
 ## 架构概览
 
 ```
