@@ -96,6 +96,87 @@ IDC (LiteLLM) ──DX──► Private VIF ──► VGW / DXGW（A）──►
 
 ### ③ A：VPCE 安全组放行 IDC 网段访问 443
 
+只放行 LiteLLM 所在网段（或具体主机 /32）的 TCP 443，不要整个 IDC 大段都放。
+
+---
+
+## 3.5 进一步收紧：只允许 IDC 上 LiteLLM 的 IP 访问
+
+**一句话结论：** 专线（DX）全程不做 NAT，VPCE 看到的就是 IDC 主机的**私网源 IP**，所以可以按 IP 做三层限制：安全组 → VPCE 策略 → B/C 的 IAM Deny。只能做一层时，优先做安全组。
+
+### 为什么专线下源 IP 不变
+
+```
+IDC LiteLLM (10.10.5.20) ──DX / Private VIF──> VGW/DXGW ──> A 的 VPC ──> VPCE ENI
+                         这一路只做路由，不做地址转换
+```
+
+- DX、Private VIF、VGW、DXGW 都只转发，不改源地址。VPCE 收到的包，源 IP 就是 `10.10.5.20`。
+- 类比：专线像一条直达的内部走廊，访客进门时还挂着自己的工牌。走公网 + NAT 则像换了一张访客证，门卫只能看到访客证。
+- 前提：**IDC 内部没有 SNAT**。如果 LiteLLM 跑在 K8s 上，或者出口经过防火墙/负载均衡做了 SNAT，要写的是 SNAT 之后的 IP（K8s 一般是节点网段或出口网关 IP）。
+
+### 三层限制
+
+| 层 | 在哪配 | 写法 | 拦住什么 |
+|---|---|---|---|
+| ① 安全组 | A 的 VPCE 安全组 | 入站 443 只放 `<LITELLM_IP>/32` | 网络层直接拒绝，其他主机连 TCP 都建不起来 |
+| ② VPCE 策略 | A 的 VPCE | `aws:VpcSourceIp` | 能连上但不是 LiteLLM 的请求（例如安全组被误放宽） |
+| ③ IAM Deny | B/C 的 LiteLLM 专用身份 | `aws:SourceVpce` + `aws:VpcSourceIp` 两条 Deny | 凭证泄露后，从别处或别的 VPCE 调用 |
+
+**② A 的 VPCE 策略**（和 `aws:PrincipalAccount` 写在同一个 Condition 里，两者是"并且"关系）：
+
+```json
+{
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": "*",
+    "Action": "bedrock:*",
+    "Resource": "*",
+    "Condition": {
+      "StringEquals": { "aws:PrincipalAccount": ["<B_ACCOUNT_ID>", "<C_ACCOUNT_ID>"] },
+      "IpAddress":    { "aws:VpcSourceIp": ["<LITELLM_IP>/32"] }
+    }
+  }]
+}
+```
+
+**③ B/C 的 IAM 策略**（在第 3 节②的基础上，再加一条 Deny）：
+
+```json
+{ "Effect": "Deny", "Action": "bedrock:*", "Resource": "*",
+  "Condition": { "StringNotEquals": { "aws:SourceVpce": ["<vpce-A-runtime>", "<vpce-A-mantle>"] } } },
+{ "Effect": "Deny", "Action": "bedrock:*", "Resource": "*",
+  "Condition": { "NotIpAddress": { "aws:VpcSourceIp": ["<LITELLM_IP>/32"] } } }
+```
+
+- **两条 Deny 必须分开写。** 同一个 Condition 里的多个条件是"并且"，合成一条就变成"既不走这个 VPCE、又不是这个 IP 才拒绝"，会留出漏洞。
+- 用 `aws:VpcSourceIp`，**不要用 `aws:SourceIp`**。请求经过 VPCE 时请求上下文里没有 `aws:SourceIp`。Allow + `IpAddress` 匹配不上，请求被拒；Deny + `NotIpAddress` 遇到缺失的键会判定为"真"，同样全部拒绝。两种写法都会把正常请求拦掉。
+
+### 怎么确认 VPCE 实际看到的源 IP
+
+不要靠猜，看 A 的 VPC Flow Logs：
+
+1. 在 VPCE 的 ENI（或整个子网）上开 Flow Logs。
+2. 在 LiteLLM 上发一次请求。
+3. 找目标地址是 VPCE ENI IP、目标端口 443 的记录，`srcaddr` 就是要写进策略的 IP。
+
+```
+# CloudWatch Logs Insights
+fields @timestamp, srcaddr, dstaddr, dstport, action
+| filter dstport = 443 and dstaddr like /^<VPCE_ENI_IP_PREFIX>/
+| stats count() by srcaddr
+```
+
+如果 `srcaddr` 不是 LiteLLM 主机的 IP，说明 IDC 内部做了 SNAT，以 `srcaddr` 为准。
+
+### 注意事项
+
+- **网段不能重叠**：IDC 网段和 A 的 VPC 网段重叠时路由会出问题，IP 限制也会失去意义。
+- **区域要对**：VPCE 要建在 DX 落地的 EU 区域（如 eu-central-1），模型用 `eu.` 推理配置文件。
+- **换机器要改三处**：LiteLLM 迁移、扩容或改 IP 时，安全组、VPCE 策略、B/C 的 IAM 策略都要同步改。建议写成 CIDR 变量，用 IaC 统一管理。
+- **多台 LiteLLM 时**：写一个专用的小网段（如 `/28`），不要逐个写 /32。
+- **待实测**：Bedrock 对 `aws:VpcSourceIp` 的支持情况还没有实测，上线前按第 8 节的第 6、7 项验证。
+
 ---
 
 ## 4. LiteLLM 配置
@@ -187,6 +268,8 @@ VPCE 必须和要调用的 Bedrock 在同一个区域：
 | 3 | 用 B 的凭证从公网直接调用 | ❌ AccessDenied（B 的 Deny 生效） |
 | 4 | 用第三个账户 D 的凭证经 A 的 VPCE 调用 | ❌ `no VPC endpoint policy allows`（A 的 VPCE 策略生效） |
 | 5 | 抓包查看 LiteLLM 出向 443 的连接 | 目标全部是 A 的 VPCE 私网 IP |
+| 6 | （做了 3.5 节时）从 IDC 另一台主机用 B 的凭证经 VPCE 调用 | ❌ 连接超时（安全组拦截）；临时放开安全组后应返回 AccessDenied（IP 条件生效） |
+| 7 | 查 Flow Logs 的 `srcaddr` | 等于策略里写的 LiteLLM IP |
 
 ---
 
