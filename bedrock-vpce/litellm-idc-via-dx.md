@@ -30,6 +30,110 @@ bedrock-runtime.us-west-2.amazonaws.com               →  34.x / 44.x（公网 
 
 ---
 
+## 1.5 创建 VPCE（CLI 步骤）
+
+Bedrock 需要**两个** Interface Endpoint，按用到的模型选建：
+
+| Service Name | Private DNS 标准域名 | 用于 | 可选 AZ（us-west-2） |
+|---|---|---|---|
+| `com.amazonaws.<region>.bedrock-runtime` | `bedrock-runtime.<region>.amazonaws.com` | Claude 等 `bedrock/` 模型；GPT 的 `/openai/v1` | 2a / 2b / 2c / 2d |
+| `com.amazonaws.<region>.bedrock-mantle` | `bedrock-mantle.<region>.api.aws` | Mantle 模型（`/v1`） | 2a / 2b / 2c（没有 2d） |
+
+> 先查一下哪些 AZ 支持：`aws ec2 describe-vpc-endpoint-services --service-names com.amazonaws.us-west-2.bedrock-mantle --query 'ServiceDetails[].AvailabilityZones'`
+
+### Step 0：VPC 前置
+
+```bash
+# Private DNS 依赖这两个 VPC 属性，都必须是 true
+aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-support '{"Value":true}'
+aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-hostnames '{"Value":true}'
+```
+
+### Step 1：给 VPCE 建专用安全组
+
+```bash
+SG_ID=$(aws ec2 create-security-group --vpc-id $VPC_ID \
+  --group-name bedrock-vpce-sg --description "Bedrock VPCE 443 from VPC + IDC" \
+  --query GroupId --output text)
+
+# VPC 内的调用方
+aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 443 --cidr $VPC_CIDR
+# IDC 网段（经 DX 过来的流量，最容易漏）
+aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 443 --cidr $IDC_CIDR
+```
+
+### Step 2：准备 Endpoint Policy（只允许本账号）
+
+```bash
+cat > vpce-policy.json <<EOF
+{
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": "*",
+    "Action": "*",
+    "Resource": "*",
+    "Condition": {"StringEquals": {"aws:PrincipalAccount": "$ACCOUNT_ID"}}
+  }]
+}
+EOF
+```
+
+### Step 3：创建 Endpoint
+
+```bash
+# 生产环境建议 2 个 AZ（高可用够用了；每多一个 AZ 每月约多 $7.3）
+SUBNETS="$SUBNET_AZ_A $SUBNET_AZ_B"
+
+aws ec2 create-vpc-endpoint --vpc-endpoint-type Interface --vpc-id $VPC_ID \
+  --service-name com.amazonaws.$REGION.bedrock-runtime \
+  --subnet-ids $SUBNETS --security-group-ids $SG_ID \
+  --private-dns-enabled --policy-document file://vpce-policy.json \
+  --tag-specifications 'ResourceType=vpc-endpoint,Tags=[{Key=Name,Value=bedrock-runtime}]'
+
+aws ec2 create-vpc-endpoint --vpc-endpoint-type Interface --vpc-id $VPC_ID \
+  --service-name com.amazonaws.$REGION.bedrock-mantle \
+  --subnet-ids $SUBNETS --security-group-ids $SG_ID \
+  --private-dns-enabled --policy-document file://vpce-policy.json \
+  --tag-specifications 'ResourceType=vpc-endpoint,Tags=[{Key=Name,Value=bedrock-mantle}]'
+```
+
+**注意：**
+- `--private-dns-enabled` 只影响 **VPC 内部**的解析。IDC 不受这个开关影响，直接用 VPCE 专属域名就行（见第 1 节）。
+- **同一个 VPC 里，同一个服务只能有一个 VPCE 开 Private DNS**，第二个会报冲突。
+- 状态从 `pending` 变成 `available` 大约需要 1–3 分钟。
+
+### Step 4：拿到 VPCE 专属域名（填进 LiteLLM 配置）
+
+```bash
+aws ec2 describe-vpc-endpoints --filters Name=vpc-id,Values=$VPC_ID \
+  --query 'VpcEndpoints[?contains(ServiceName,`bedrock`)].{svc:ServiceName,state:State,dns:DnsEntries[0].DnsName}' \
+  --output table
+```
+
+`DnsEntries[0]` 是 Regional 域名（形如 `vpce-<id>-<hash>.bedrock-runtime.<region>.vpce.amazonaws.com`），用这个。后面几条是按 AZ 拆分的域名（带 `-us-west-2a` 之类的后缀），一般不用，因为它们没有跨 AZ 故障切换。
+
+### Step 5：验证
+
+```bash
+# 在 IDC 机器上执行：应该解析到 VPCE 私网 IP
+dig +short vpce-<id>-<hash>.bedrock-runtime.<region>.vpce.amazonaws.com
+# 443 端口应该能连通
+curl -sS -o /dev/null -w '%{http_code}\n' https://vpce-<id>-<hash>.bedrock-runtime.<region>.vpce.amazonaws.com/
+```
+
+`curl` 返回 403 或 404 都算正常，说明网络已经通了，只是没带签名。如果超时，就是专线路由或安全组的问题。
+
+### 费用（us-west-2）
+
+| 项目 | 单价 |
+|---|---|
+| 小时费 | $0.01 / 小时 / 每个 AZ（2 个 AZ ≈ 每月 $14.6 / 每个 VPCE） |
+| 数据处理费 | $0.01/GB（每月 1 PB 以内），$0.006/GB（1–5 PB），$0.004/GB（5 PB 以上） |
+
+LLM 流量按每 100 万 token 约 5–10 MB 估算，10 亿 token 的流量费只有约 $0.1，大约是 token 费的万分之一。DX 出向流量（AWS → IDC，北美约 $0.02/GB）另算，量级同样很小。
+
+---
+
 ## 2. LiteLLM 配置（v1.99.0 实测通过）
 
 Bedrock 有两个服务，对应两个 VPCE，LiteLLM 里有三种写法：
